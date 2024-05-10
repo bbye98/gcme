@@ -37,11 +37,20 @@ instead due to recent internal LAMMPS API changes.
     │   ├── gcme_slab_real.lmp      # LAMMPS: Slab GCMe system
     │   └── gcme_all.py             # OpenMM: GCMe systems w/ all three BCs
     ├── analysis_gcme.ipynb
-    └── nvt_polyanion_counterion_solvent.py
+    ├── npt_water.py
+    ├── nvt_polyanion_counterion_solvent.py
+    └── nvt_water.py
 
 The `benchmark` directory contains scripts to run simulations of simple
 coarse-grained systems for the benchmark results in the "Performance"
 section of the paper.
+
+The `npt_water.py` script runs NpT simulations of coarse-grained "water"
+particles at different pressures and repulsion parameters to determine
+the key GCMe parametrization relationship in the "Parametrization"
+section of the paper. The `nvt_water.py` script runs NVT simulations of
+the parametrized GCM so that the most probable pair separation distance
+can be determined using the radial distribution function.
 
 The `nvt_polyanion_counterion_solvent.py` script runs NVT simulations of
 polyanions, their counterions, and solvent particles confined between

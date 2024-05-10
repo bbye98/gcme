@@ -182,9 +182,7 @@ def run(N: int, N_p: int, x_p: float, bc: str, frames: int, *,
 
     # Initialize simulation system and topology
     system = openmm.System()
-    system.setDefaultPeriodicBoxVectors(
-        *(dims * np.diag(np.ones(3, dtype=float)))
-    )
+    system.setDefaultPeriodicBoxVectors(*(dims * np.diag(np.ones(3))))
     topology = app.Topology()
     topology.setUnitCellDimensions(dims)
     logging.info("Created simulation system and topology with "
