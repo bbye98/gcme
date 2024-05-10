@@ -1,0 +1,86 @@
+# ==================================================================== #
+# PARAMETERS AND SETTINGS                                              #
+# ==================================================================== #
+
+shell           cd /mnt/e/research/gcme/data/performance/gcme
+# variable        dt_reduced equal 0.02
+log             bulk_dtmd_${dt_reduced}_real_lammps.log
+
+variable        N equal 1000
+variable        T equal 300                                     # Kelvin
+variable        diameter equal 5.924695397587681                # angstrom
+variable        mass equal 72.06112                             # gram/mole
+variable        q equal 1                                       # elementary charge
+variable        varepsilon_r equal 78
+variable        time_scale equal 3184.482093524509              # femtosecond
+
+variable        L_x equal 32.585824686732248                    # angstrom
+variable        L_y equal 30.785620343974065                    # angstrom
+variable        L_z equal 82.92422988275838                     # angstrom
+
+variable        cutoff equal 11.399508857791008                 # angstrom
+
+variable        diameter_ion_wall equal v_diameter/2            # angstrom
+variable        unit_cell_x equal v_diameter_ion_wall/2         # angstrom
+variable        unit_cell_y equal v_diameter_ion_wall*sqrt(3)/2 # angstrom
+variable        unit_cell_z equal v_diameter_ion_wall*sqrt(6)/3 # angstrom
+variable        N_wall equal 2*v_L_x*v_L_y/(v_unit_cell_x*v_unit_cell_x)
+variable        q_wall equal v_sigma_q*v_L_x*v_L_y/v_N_wall     # elementary charge
+
+variable        every equal 1000
+variable        timesteps equal 100000
+
+variable        rng1 equal 12798
+variable        rng2 equal 9990
+variable        rng3 equal 22263
+variable        rng4 equal 101763
+
+# ==================================================================== #
+# SYSTEM AND PARTICLES                                                 #
+# ==================================================================== #
+
+units           real
+atom_style      charge
+region          box block 0 ${L_x} 0 ${L_y} 0 ${L_z} units box
+create_box      2 box
+
+mass            * ${mass}
+region          electrolyte block 0 ${L_x} 0 ${L_y} ${diameter_ion_wall} $(v_L_z-v_diameter_ion_wall) units box
+create_atoms    1 random $(v_N/2) ${rng1} electrolyte
+create_atoms    2 random $(v_N/2) ${rng2} electrolyte
+set             type 1 charge $q
+set             type 2 charge -$q
+group           electrolyte type 1 2
+
+# ==================================================================== #
+# FORCE FIELD                                                          #
+# ==================================================================== #
+
+dielectric      ${varepsilon_r}
+kspace_style    pppm 1e-4
+
+pair_style      hybrid/overlay gauss ${cutoff} buck6d/coul/gauss/long 1 1 ${cutoff}
+pair_coeff      *2 *2 gauss -14.03251847888551 0.08546517778638874
+pair_coeff      *2 *2 buck6d/coul/gauss/long 0 0 0 0 0.29916370918025487
+pair_modify     pair gauss shift yes
+
+velocity        electrolyte create ${T} ${rng4}
+fix             nvt electrolyte nvt temp ${T} ${T} $(100*dt)
+
+# ==================================================================== #
+# ENERGY MINIMIZATION                                                  #
+# ==================================================================== #
+
+minimize        1e-6 1e-6 1000 1000
+reset_timestep  0
+timestep        $(v_dt_reduced*v_time_scale)
+
+# ==================================================================== #
+# SIMULATION                                                           #
+# ==================================================================== #
+
+write_data      bulk_dtmd_${dt_reduced}_real_lammps.topology
+dump            dump all netcdf ${every} bulk_dtmd_${dt_reduced}_real_lammps.nc id type q x y z ix iy iz vx vy vz fx fy fz
+thermo          ${every}
+thermo_style    custom step spcpu cpuremain temp press ke evdwl ecoul elong
+run             ${timesteps}

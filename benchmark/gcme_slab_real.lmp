@@ -1,0 +1,107 @@
+# ==================================================================== #
+# PARAMETERS AND SETTINGS                                              #
+# ==================================================================== #
+
+shell           cd /mnt/e/research/gcme/data/performance/gcme
+variable        sigma_q equal 0.005                             # elementary charge/angstrom^2
+# variable        dt_reduced equal 0.02
+log             slab_sigmaq_${sigma_q}_dtmd_${dt_reduced}_real_lammps.log
+
+variable        N equal 1000
+variable        T equal 300                                     # Kelvin
+variable        diameter equal 5.924695397587681                # angstrom
+variable        mass equal 72.06112                             # gram/mole
+variable        q equal 1                                       # elementary charge
+variable        varepsilon_r equal 78
+variable        time_scale equal 3184.482093524509              # femtosecond
+
+variable        L_x equal 32.585824686732248                    # angstrom
+variable        L_y equal 30.785620343974065                    # angstrom
+variable        L_z equal 82.92422988275838                     # angstrom
+
+variable        cutoff equal 11.399508857791008                 # angstrom
+
+variable        diameter_ion_wall equal v_diameter/2            # angstrom
+variable        unit_cell_x equal v_diameter_ion_wall/2         # angstrom
+variable        unit_cell_y equal v_diameter_ion_wall*sqrt(3)/2 # angstrom
+variable        unit_cell_z equal v_diameter_ion_wall*sqrt(6)/3 # angstrom
+variable        N_wall equal 2*v_L_x*v_L_y/(v_unit_cell_x*v_unit_cell_x)
+variable        q_wall equal v_sigma_q*v_L_x*v_L_y/v_N_wall     # elementary charge
+
+variable        every equal 1000
+variable        timesteps equal 100000
+
+variable        rng1 equal 12798
+variable        rng2 equal 9990
+variable        rng3 equal 22263
+variable        rng4 equal 101763
+
+# ==================================================================== #
+# SYSTEM AND PARTICLES                                                 #
+# ==================================================================== #
+
+units           real
+boundary        p p f
+atom_style      charge
+region          box block 0 ${L_x} 0 ${L_y} 0 ${L_z} units box
+create_box      4 box
+
+mass            * ${mass}
+region          electrolyte block 0 ${L_x} 0 ${L_y} ${diameter_ion_wall} $(v_L_z-v_diameter_ion_wall) units box
+create_atoms    1 random $(v_N/2) ${rng1} electrolyte
+create_atoms    2 random $(v_N/2) ${rng2} electrolyte
+set             type 1 charge $q
+set             type 2 charge -$q
+group           electrolyte type 1 2
+
+lattice         hcp ${diameter_ion_wall}
+region          left_wall block 0 ${L_x} 0 ${L_y} 0 $(v_unit_cell_z-1e-14) units box
+create_atoms    3 region left_wall
+lattice         hcp ${diameter_ion_wall} origin 0 0 0.14198257421933
+region          right_wall block 0 ${L_x} 0 ${L_y} $(v_L_z-v_unit_cell_z) ${L_z} units box
+create_atoms    4 region right_wall
+set             type 3 charge 0
+set             type 4 charge 0
+group           electrodes type 3 4
+
+# ==================================================================== #
+# FORCE FIELD                                                          #
+# ==================================================================== #
+
+dielectric      ${varepsilon_r}
+kspace_style    pppm 1e-4
+kspace_modify   slab 3
+
+pair_style      hybrid/overlay gauss ${cutoff} buck6d/coul/gauss/long 1 1 ${cutoff}
+pair_coeff      *2 *2 gauss -14.03251847888551 0.08546517778638874
+pair_coeff      *2 3*4 gauss -39.68995589418193 0.17093035557277747
+pair_coeff      3*4 3* gauss 0 0 
+pair_coeff      *2 *2 buck6d/coul/gauss/long 0 0 0 0 0.29916370918025487
+pair_coeff      *2 3*4 buck6d/coul/gauss/long 0 0 0 0 0 0.42308137489255687
+pair_coeff      3*4 3*4 buck6d/coul/gauss/long 0 0 0 0 0 0
+pair_modify     pair gauss shift yes
+
+velocity        electrolyte create ${T} ${rng4}
+velocity        electrodes set 0 0 0
+fix             nvt electrolyte nvt temp ${T} ${T} $(100*dt)
+fix             electrodes electrodes setforce 0 0 0
+
+# ==================================================================== #
+# ENERGY MINIMIZATION                                                  #
+# ==================================================================== #
+
+minimize        1e-6 1e-6 1000 1000
+reset_timestep  0
+timestep        $(v_dt_reduced*v_time_scale)
+set             type 3 charge ${q_wall}
+set             type 4 charge $(-v_q_wall)
+
+# ==================================================================== #
+# SIMULATION                                                           #
+# ==================================================================== #
+
+write_data      slab_sigmaq_${sigma_q}_dtmd_${dt_reduced}_real_lammps.topology
+dump            dump all netcdf ${every} slab_sigmaq_${sigma_q}_dtmd_${dt_reduced}_real_lammps.nc id type q x y z ix iy iz vx vy vz fx fy fz
+thermo          ${every}
+thermo_style    custom step spcpu cpuremain temp press ke evdwl ecoul elong
+run             ${timesteps}
