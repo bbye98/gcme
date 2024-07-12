@@ -3,12 +3,12 @@
 """
 nvt_polyanion_cation_wall.py
 ============================
-Simulates canonical (NVT) systems of equisized polyanions, their
-counterions, and solvent particles confined between two planar
-electrodes using OpenMM. The force field used is the Gaussian core model
-with smeared electrostatic interactions (GCMe), and the boundary
-polarizability is accounted for using either the method of image charges
-or the Yeh–Berkowitz slab correction.
+Simulates canonical (NVT) systems of polyanions, their counterions, and
+solvent particles confined between two planar electrodes using OpenMM.
+The force field used is the Gaussian core model with smeared
+electrostatic interactions (GCMe), and the boundary polarizability is
+accounted for using either the method of image charges or the
+Yeh–Berkowitz slab correction.
 """
 
 from itertools import combinations
@@ -23,26 +23,31 @@ import openmm
 from openmm import app, unit
 from scipy import optimize
 
-from mdcraft.openmm import pair, reporter, system as s, topology as t, unit as u
+from mdcraft.openmm.pair import coul_gauss, gauss
+from mdcraft.openmm.reporter import NetCDFReporter
+from mdcraft.openmm.system import (register_particles, add_image_charges,
+                                   add_slab_correction)
+from mdcraft.openmm.topology import create_atoms
+from mdcraft.openmm.unit import VACUUM_PERMITTIVITY, get_lj_scale_factors
 
 ORIG_PATH = os.getcwd()             # Original directory
-ROOM_TEMP = 300 * unit.kelvin       # Room temperature (300 K)
+ROOM_TEMP = 300 * unit.kelvin       # Room temperature
 MW = 18.01528 * unit.amu            # Water molar mass
 DIAMETER = 0.275 * unit.nanometer   # Water molecule size
-KAPPA_INV = 15.9835                 # Water dimensionless compressibility (300 K)
+KAPPA_INV = 15.9835                 # Water dimensionless compressibility @ 300 K
 OMEGA = 0.499                       # GCM scaling parameter
 
 def run(N: int, N_p: int, x_p: float, bc: str, frames: int, *,
         temperature: unit.Quantity = ROOM_TEMP, size: unit.Quantity = DIAMETER,
         mass: unit.Quantity = MW, N_m: float = 4.0, varepsilon_r: float = 78.0,
         rho_md: float = 2.5, b_md: float = 0.8, k_md: float = 100.0,
-        u_shift_md: float = 1e-3, dt_md: float = 0.02,  every: int = 10_000,
+        u_shift_md: float = 1e-3, dt_md: float = 0.02, every: int = 10_000,
         a_scale: float = 1.0, L_z_scale: float = 2.5, device: int = 0,
         index: int = None, path: str = None, verbose: bool = True) -> None:
 
     """
-    Run a NVT simulation of polyanions, counterions, and solvent
-    particles confined between two planar walls using OpenMM.
+    Run a NVT simulation of coarse-grained polyanions, counterions, and
+    solvent particles confined between two planar walls using OpenMM.
 
     Parameters
     ----------
@@ -53,7 +58,7 @@ def run(N: int, N_p: int, x_p: float, bc: str, frames: int, *,
         Polyanion chain length.
 
     x_p : `float`
-        Polyanion number concentration.
+        Polyanion fraction.
 
         **Valid values**: `x_p` must be between 0 and 0.5.
 
@@ -82,19 +87,19 @@ def run(N: int, N_p: int, x_p: float, bc: str, frames: int, *,
 
     size : `openmm.unit.Quantity`, keyword-only, \
     default: :code:`0.275 * unit.nanometer`
-        Simulation bead diameter.
+        Particle diameter basis.
 
         **Reference unit**: :math:`\\mathrm{nm}`.
 
     mass : `openmm.unit.Quantity`, keyword-only, \
     default: :code:`18.01528 * unit.amu`
-        Simulation bead mass.
+        Particle mass basis.
 
         **Reference unit**: :math:`\\mathrm{g/mol}`.
 
     N_m : `float`, keyword-only, default: :code:`3.0`
-        GCM real space scaling parameter, roughly defined as the number
-        of water molecules per simulation bead.
+        GCMe real space renormalization parameter, roughly defined as
+        the number of water molecules per simulation particle.
 
     varepsilon_r : `float`, keyword-only, default: :code:`78.0`
         Relative permittivity.
@@ -108,14 +113,14 @@ def run(N: int, N_p: int, x_p: float, bc: str, frames: int, *,
     k_md : `float`, keyword-only, default: :code:`100.0`
         Reduced bond spring constant.
 
-    u_shift_md : `float`, keyword-only, default: :code:`1e-3`
+    u_shift_md : `float`, keyword-only, default: :code:`1e-6`
         Reduced potential energy at which to truncate and shift the
-        nonelectrostatic excluded volume interactions.
+        excluded volume interaction potential.
 
     dt_md : `float`, keyword-only, default: :code:`0.02`
         Reduced timestep.
 
-    every : `int`, keyword-only, default: :code:`10000`
+    every : `int`, keyword-only, default: :code:`10_000`
         Thermodynamic data and trajectory output frequency.
 
     a_scale : `float`, keyword-only, default: :code:`1.0`
@@ -136,8 +141,8 @@ def run(N: int, N_p: int, x_p: float, bc: str, frames: int, *,
         **Valid values**: `index` must be greater than or equal to 0.
 
     path : `str`, keyword-only, optional
-        Directory to store data. If it does not exist, it is created. If
-        not specified, the directory containing this script is used.
+        Directory to store data. If it does not exist, it will be
+        created. If not specified, the current directory is used.
 
     verbose : `bool`, keyword-only, default: :code:`True`
         Determines whether detailed progress is shown.
@@ -158,13 +163,14 @@ def run(N: int, N_p: int, x_p: float, bc: str, frames: int, *,
     logging.info(f"Changed to data directory '{path}'.")
 
     # Determine the parameter scales using the fundamental quantities
-    scales = u.get_lj_scaling_factors({
-        "energy": (unit.BOLTZMANN_CONSTANT_kB * temperature).in_units_of(
-            unit.kilojoule
-        ),
-        "length": size * (N_m * rho_md) ** (1 / 3) if N_m > 1 else size,
-        "mass": mass * N_m
-    })
+    scales = get_lj_scale_factors(
+        {
+            "energy": (unit.BOLTZMANN_CONSTANT_kB * temperature)
+                      .in_units_of(unit.kilojoule),
+            "length": size * (N_m * rho_md) ** (1 / 3) if N_m > 1 else size,
+            "mass": mass * N_m
+        }
+    )
     logging.info("Computed scaling factors for reducing physical quantities.\n"
                  "  Fundamental quantities:\n"
                  f"    Molar energy: {scales['molar_energy']}\n"
@@ -174,19 +180,22 @@ def run(N: int, N_p: int, x_p: float, bc: str, frames: int, *,
     # Determine the system dimensions
     rho = rho_md / scales["length"] ** 3
     L_nd = ((N / (L_z_scale * rho)) ** (1 / 3)).value_in_unit(unit.nanometer)
-    pos_wall, dims = t.create_atoms(np.array((L_nd, L_nd, 0)),
-                                    lattice="hcp",
-                                    length=scales["length"] / 2,
-                                    flexible=True)
-    dims[2] = N / (rho * dims[0] * dims[1])
+    positions_wall, dimensions = create_atoms(
+        np.array((L_nd, L_nd, 0)),
+        lattice="hcp",
+        length=scales["length"] / 2,
+        flexible=True
+    )
+    dimensions[2] = N / (rho * dimensions[0] * dimensions[1])
 
     # Initialize simulation system and topology
     system = openmm.System()
-    system.setDefaultPeriodicBoxVectors(*(dims * np.diag(np.ones(3))))
+    system.setDefaultPeriodicBoxVectors(*(dimensions * np.diag(np.ones(3))))
     topology = app.Topology()
-    topology.setUnitCellDimensions(dims)
+    topology.setUnitCellDimensions(dimensions)
     logging.info("Created simulation system and topology with "
-                 f"dimensions {dims[0]} x {dims[1]} x {dims[2]}.")
+                 f"dimensions {dimensions[0]} x {dimensions[1]} "
+                 f"x {dimensions[2]}.")
 
     # Set up the nonelectrostatic excluded volume interactions
     # Types: real particle (p), wall (w), image charge (i)
@@ -214,21 +223,23 @@ def run(N: int, N_p: int, x_p: float, bc: str, frames: int, *,
                   / scales["molar_energy"] - u_shift_md,
         scales["length"].value_in_unit(unit.nanometer)
     )[0] * unit.nanometer
-    pair_gauss = pair.gauss(cutoff, mix="alpha12=alpha(type1,type2);"
-                                        "beta12=beta(type1,type2);",
-                            per_params=("type",),
-                            tab_funcs={"alpha": alphas_ij, "beta": betas_ij})
+    pair_gauss = gauss(
+        cutoff,
+        mix="alpha12=alpha(type1,type2);beta12=beta(type1,type2);",
+        per_params=("type",),
+        tab_funcs={"alpha": alphas_ij, "beta": betas_ij}
+    )
 
     # Set up the electrostatic smeared Coulomb potential
     # Types: real or image particle (p), wall (w)
     as_i_sq = (np.array((a_scale, 0)) * scales["length"] / 2) ** 2
-    as_ij = (as_i_sq + as_i_sq[:, None]) ** (1 / 2)
-        # pp, pw; wp, ww
+    as_ij = (as_i_sq + as_i_sq[:, None]) ** (1 / 2) # pp, pw; wp, ww
     e = 1 * unit.elementary_charge
-    dielectric_min = np.ceil(unit.AVOGADRO_CONSTANT_NA * e ** 2
-                             * (np.pi * np.max(sigmas_ij_sq) ** 3
-                                / 27) ** (1 / 2)
-                             / (u.VACUUM_PERMITTIVITY * A * as_ij[0, 0]))
+    dielectric_min = np.ceil(
+        unit.AVOGADRO_CONSTANT_NA * e ** 2
+        * (np.pi * np.max(sigmas_ij_sq) ** 3 / 27) ** (1 / 2)
+        / (VACUUM_PERMITTIVITY * A * as_ij[0, 0])
+    )
     if varepsilon_r < dielectric_min:
         wmsg = (f"The relative permittivity ε={varepsilon_r} is too "
                 "low, which can cause oppositely-charged ions to "
@@ -236,8 +247,10 @@ def run(N: int, N_p: int, x_p: float, bc: str, frames: int, *,
                 f"approximately ε={dielectric_min:.6g}.")
         warnings.warn(wmsg)
     q_scaled = e / np.sqrt(varepsilon_r)
-    pair_elec_dir, pair_elec_rec = pair.coul_gauss(
-        cutoff, mix="alpha12=alpha(type1,type2);", per_params=("type",),
+    pair_elec_dir, pair_elec_rec = coul_gauss(
+        cutoff,
+        mix="alpha12=alpha(type1,type2);",
+        per_params=("type",),
         tab_funcs={"alpha": np.sqrt(np.pi / 2) / as_ij}
     )
 
@@ -275,10 +288,13 @@ def run(N: int, N_p: int, x_p: float, bc: str, frames: int, *,
     # Register polyanions to pair potentials
     for _ in range(M):
         chain = topology.addChain()
-        s.register_particles(
-            system, topology, N_p, scales["mass"], chain=chain,
-            element=element_a, name="PAN", resname="PAN",
-            nbforce=pair_elec_rec, charge=-q_scaled,
+        register_particles(
+            system, topology, N_p, scales["mass"],
+            chain=chain,
+            element=element_a,
+            name="PAN",
+            nbforce=pair_elec_rec,
+            charge=-q_scaled,
             cnbforces={pair_elec_dir: (-q_scaled, 0), pair_gauss: (0,)}
         )
     logging.info(f"Registered {M:,} polyanion(s) with {N_p:,} monomer(s) "
@@ -300,45 +316,49 @@ def run(N: int, N_p: int, x_p: float, bc: str, frames: int, *,
                      "the force field.")
 
     # Register counterions to pair potentials
-    s.register_particles(
+    register_particles(
         system, topology, N_c, scales["mass"],
-        element=element_c, name="CAT", resname="CAT",
-        nbforce=pair_elec_rec, charge=q_scaled,
+        element=element_c,
+        name="CAT",
+        nbforce=pair_elec_rec,
+        charge=q_scaled,
         cnbforces={pair_elec_dir: (q_scaled, 0), pair_gauss: (0,)}
     )
     logging.info(f"Registered {N_c:,} counterion(s) to the simulation.")
 
     # Register solvent particles to pair potentials
-    s.register_particles(
+    register_particles(
         system, topology, N_s, scales["mass"],
-        element=element_s, name="SOL", resname="SOL",
+        element=element_s,
+        name="SOL",
+        resname="SOL",
         nbforce=pair_elec_rec,
         cnbforces={pair_elec_dir: (0, 0), pair_gauss: (0,)}
     )
     logging.info(f"Registered {N_s:,} solvent particle(s) to the simulation.")
 
     # Determine positions and number of wall particles
-    pos_wall = np.concatenate((
-        pos_wall,
-        pos_wall + np.array(
-            (0, 0, dims[2].value_in_unit(unit.nanometer))
+    positions_wall = np.concatenate((
+        positions_wall,
+        positions_wall + np.array(
+            (0, 0, dimensions[2].value_in_unit(unit.nanometer))
         ) * unit.nanometer
     ))
-    N_w = pos_wall.shape[0]
+    N_wall = positions_wall.shape[0]
 
     # Register wall particles to pair potentials
     for name in ("LWL", "RWL"):
-        s.register_particles(
-            system, topology, N_w // 2, 0,
-            element=element_w, name=name,
+        register_particles(
+            system, topology, N_wall // 2, 0,
+            element=element_w,
+            name=name,
             nbforce=pair_elec_rec,
             cnbforces={pair_elec_dir: (0, 1), pair_gauss: (1,)}
-            # cnbforces={pair_elec_dir: (0, 1), pair_gauss: (1,)}
         )
-    logging.info(f"Registered {N_w:,} wall particles to the force field.")
+    logging.info(f"Registered {N_wall:,} wall particles to the force field.")
 
     # Remove wall–wall interactions
-    wall_indices = range(N, N + N_w)
+    wall_indices = range(N, N + N_wall)
     for i, j in combinations(wall_indices, 2):
         pair_elec_dir.addExclusion(i, j)
         pair_elec_rec.addException(i, j, 0, 0, 0)
@@ -348,12 +368,12 @@ def run(N: int, N_p: int, x_p: float, bc: str, frames: int, *,
     # Determine the filename prefix
     if index is None:
         index = 0
-    fname = (f"nvt_N_{N}_Np_{N_p}_xp_{x_p:.3f}_rp_{varepsilon_r:.1f}_"
-             f"A_{A_md:.3f}__{index}")
+    filename = (f"nvt_N_{N}_Np_{N_p}_xp_{x_p:.3f}_rp_{varepsilon_r:.1f}_"
+                f"A_{A_md:.3f}__{index}")
 
     # Ensure a simulation with the same filename does not already exist
-    if os.path.isfile(f"{fname}.nc"):
-        emsg = (f"A simulation with the filename prefix '{fname}' "
+    if os.path.isfile(f"{filename}.nc"):
+        emsg = (f"A simulation with the filename prefix '{filename}' "
                 "already exists.")
         raise RuntimeError(emsg)
 
@@ -368,56 +388,59 @@ def run(N: int, N_p: int, x_p: float, bc: str, frames: int, *,
         prev_fname = None
 
     # Create OpenMM CUDA Platform
-    plat = openmm.Platform.getPlatformByName("CUDA")
+    platform_ = openmm.Platform.getPlatformByName("CUDA")
     properties = {"Precision": "mixed", "DeviceIndex": str(device),
                   "UseBlockingSync": "false"}
     dt = dt_md * scales["time"]
-    fric = 1e-3 / dt
-    logging.info(f"Initialized the {plat.getName()} platform in OpenMM "
-                 f"{plat.getOpenMMVersion()} on {platform.node()}.")
+    friction = 1e-3 / dt
+    logging.info(f"Initialized the {platform_.getName()} platform in OpenMM "
+                 f"{platform_.getOpenMMVersion()} on {platform.node()}.")
 
     # Set up simulation system
     while True:
 
         # Generate initial particle positions
         if x_p == 1:
-            pos_sys = t.create_atoms(dims, N_a, N_p=N_p, length=b,
-                                     randomize=True)
+            positions_system = create_atoms(dimensions, N_a, N_p=N_p, length=b,
+                                            randomize=True)
         elif x_p == 0:
-            pos_sys = t.create_atoms(dims, N_s)
+            positions_system = create_atoms(dimensions, N_s)
         else:
-            pos_sys = np.concatenate((
-                t.create_atoms(dims, N_a, N_p=N_p, length=b, randomize=True),
-                t.create_atoms(dims, N_c + N_s)
+            positions_system = np.concatenate((
+                create_atoms(dimensions, N_a, N_p=N_p, length=b, randomize=True),
+                create_atoms(dimensions, N_c + N_s)
             )) * unit.nanometer
 
         # Scale z-positions to prevent particles from clipping through the walls
-        pos_z_factor = 0.1
-        pos_z_wall = 2 ** (-5 / 6) * scales["length"]
-        pos_z_scale = (((1 - pos_z_factor) * dims[2] - pos_z_wall)
-                       / (np.max(pos_sys[:, 2]) - np.min(pos_sys[:, 2])))
-        pos_sys *= np.array((1, 1, pos_z_scale))
-        pos_sys[:, 2] += (pos_z_wall + pos_z_factor * dims[2]) / 2 \
-                         - pos_z_scale * np.min(pos_sys[:, 2])
+        z_factor = 0.1
+        z_wall = 2 ** (-5 / 6) * scales["length"]
+        z_scale = (((1 - z_factor) * dimensions[2] - z_wall)
+                   / (positions_system[:, 2].max() - positions_system[:, 2].min()))
+        positions_system *= np.array((1, 1, z_scale))
+        positions_system[:, 2] \
+            += ((z_wall + z_factor * dimensions[2]) / 2
+                - z_scale * positions_system[:, 2].min())
 
         # Concatenate particle and wall positions
-        pos = np.concatenate((pos_sys, pos_wall)) * unit.nanometer
+        positions = np.concatenate(
+            (positions_system, positions_wall)
+        ) * unit.nanometer
         if prev_fname:
             break
         logging.info("Generated random initial configuration for "
-                     f"{N:,} particles and {N_w:,} wall particles.")
+                     f"{N:,} particles and {N_wall:,} wall particles.")
 
         # Perform NVT energy minimization
         logging.info("Starting system relaxation...")
-        integrator = openmm.LangevinMiddleIntegrator(temperature, fric, dt)
-        simulation = app.Simulation(topology, system, integrator, plat,
+        integrator = openmm.LangevinMiddleIntegrator(temperature, friction, dt)
+        simulation = app.Simulation(topology, system, integrator, platform_,
                                     properties)
-        simulation.context.setPositions(pos)
+        simulation.context.setPositions(positions)
         simulation.minimizeEnergy()
-        pos = simulation.context.getState(getPositions=True).getPositions(
-            asNumpy=True
-        )
-        if pos[:N, 2].min() > 0 * unit.nanometer and pos[:N, 2].max() < dims[2]:
+        positions = (simulation.context.getState(getPositions=True)
+                     .getPositions(asNumpy=True))
+        if positions[:N, 2].min() > 0 * unit.nanometer \
+                and positions[:N, 2].max() < dimensions[2]:
             logging.info("Local energy minimization completed.")
             break
         logging.warning("Particles have escaped the simulation box! "
@@ -425,19 +448,20 @@ def run(N: int, N_p: int, x_p: float, bc: str, frames: int, *,
 
     # Apply method of image charges or slab correction
     if bc == "ic":
-        pos, integrator = s.add_image_charges(
-            system, topology, pos, temperature, fric, dt,
+        positions, integrator = add_image_charges(
+            system, topology, positions, temperature, friction, dt,
             wall_indices=wall_indices,
-            nbforce=pair_elec_rec, cnbforces={
-                pair_elec_dir: {"charge": 0}, pair_gauss: {"replace": {0: 2}}
-            }
+            nbforce=pair_elec_rec,
+            cnbforces={pair_elec_dir: {"charge": 0},
+                       pair_gauss: {"replace": {0: 2}}}
         )
     elif bc == "slab":
-        integrator = s.add_slab_correction(system, topology, pair_elec_rec,
-                                           temperature, fric, dt)
+        integrator = add_slab_correction(system, topology, pair_elec_rec,
+                                         temperature, friction, dt)
 
     # Set up new simulation system with the updated integrator
-    simulation = app.Simulation(topology, system, integrator, plat, properties)
+    simulation = app.Simulation(topology, system, integrator, platform_,
+                                properties)
     if prev_fname:
         try:
             simulation.loadCheckpoint(f"{prev_fname}.chk")
@@ -447,39 +471,28 @@ def run(N: int, N_p: int, x_p: float, bc: str, frames: int, *,
             simulation.loadState(f"{prev_fname}.xml")
             logging.info(f"Previous simulation state loaded from "
                          f"'{prev_fname}.xml'.")
-        pos = simulation.context.getState(getPositions=True).getPositions(
-            asNumpy=True
-        )
+        positions = (simulation.context.getState(getPositions=True)
+                     .getPositions(asNumpy=True))
     else:
-        simulation.context.setPositions(pos)
-        vel_ref = np.sqrt(
-            3 * scales["molar_energy"] / scales["mass"]
-        ).in_units_of(unit.nanometer / unit.picosecond)
-        vel = np.random.uniform(-1, 1, (N, 2))
-        vel /= np.linalg.norm(vel, axis=1)[:, None]
-        vel = np.hstack((vel, np.zeros((N, 1))))
-        vel = np.vstack((vel, np.zeros((N_w, 3))))
-        if bc == "ic":
-            vel = np.vstack((vel, np.zeros_like(vel)))
-        vel *= vel_ref
-        simulation.context.setVelocities(vel)
+        simulation.context.setPositions(positions)
+        simulation.context.setVelocitiesToTemperature(temperature)
 
     # Write topology file
-    with open(f"{fname}.cif", "w") as f:
-        app.PDBxFile.writeFile(simulation.topology, pos, f, keepIds=True)
-    logging.info(f"Wrote topology to '{fname}.cif'.")
+    with open(f"{filename}.cif", "w") as f:
+        app.PDBxFile.writeFile(simulation.topology, positions, f, keepIds=True)
+    logging.info(f"Wrote topology to '{filename}.cif'.")
 
     # Register checkpoint, thermodynamic state data, and trajectory reporters
     simulation.reporters.append(
-        app.CheckpointReporter(f"{fname}.chk", 100 * every)
+        app.CheckpointReporter(f"{filename}.chk", 100 * every)
     )
     logging.info("Registered checkpoint reporter writing to "
-                 f"'{fname}.cif' to the simulation.")
-    simulation.reporters.append(reporter.NetCDFReporter(f"{fname}.nc", every))
+                 f"'{filename}.cif' to the simulation.")
+    simulation.reporters.append(NetCDFReporter(f"{filename}.nc", every))
     logging.info("Registered trajectory reporter writing to "
-                 f"'{fname}.nc' to the simulation.")
+                 f"'{filename}.nc' to the simulation.")
     timesteps = frames * every
-    for o in [sys.stdout, f"{fname}.log"]:
+    for o in [sys.stdout, f"{filename}.log"]:
         simulation.reporters.append(
             app.StateDataReporter(
                 o, reportInterval=every, step=True, temperature=True,
@@ -489,14 +502,14 @@ def run(N: int, N_p: int, x_p: float, bc: str, frames: int, *,
             )
         )
     logging.info("Registered state data reporter writing to "
-                 f"'{fname}.log' to the simulation.")
+                 f"'{filename}.log' to the simulation.")
 
     # Run NVT simulation
     logging.info(f"Starting NVT run with {timesteps:,} timesteps...")
     simulation.step(timesteps)
-    simulation.saveState(f"{fname}.xml")
+    simulation.saveState(f"{filename}.xml")
     logging.info("Simulation completed. Wrote final simulation state "
-                 f"to '{fname}.xml'.")
+                 f"to '{filename}.xml'.")
 
 if __name__ == "__main__":
 
@@ -511,6 +524,4 @@ if __name__ == "__main__":
 
     for bc in bcs:
         for x_p in xs_p:
-            run(N, N_p, x_p, bc, frames,
-                index=index,
-                path=f"{path}/{bc}")
+            run(N, N_p, x_p, bc, frames, index=index, path=f"{path}/{bc}")

@@ -2,7 +2,10 @@
 
 This repository contains the code used in the journal article
 
-> Ye, B. B.; Chen, S.; Wang, Z.-G. GCMe: Efficient Implementation of Gaussian Core Model with Smeared Electrostatic Interactions for Molecular Dynamics Simulations of Soft Matter Systems. **2024**. https://doi.org/10.48550/ARXIV.2403.08148.
+> Ye, B. B.; Chen, S.; Wang, Z.-G. GCMe: Efficient Implementation of Gaussian
+Core Model with Smeared Electrostatic Interactions for Molecular Dynamics
+Simulations of Soft Matter Systems. **2024**.
+https://doi.org/10.48550/ARXIV.2403.08148.
 
 ### Pre-requisites
 
@@ -12,7 +15,8 @@ The Python scripts require
 3.9 or later,
 * [OpenMM](
 http://docs.openmm.org/latest/userguide/application/01_getting_started.html),
-* [MDCraft](https://github.com/bbye98/mdcraft) and its dependencies, and
+* [MDCraft](https://github.com/bbye98/mdcraft) 1.1 or later and its
+dependencies, and
 * either [`constvplugin`](https://github.com/scychon/openmm_constV) or
 [`openmm-ic-plugin`](
 https://github.com/bbye98/mdcraft/tree/main/lib/openmm-ic-plugin)

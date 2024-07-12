@@ -14,7 +14,7 @@ from mdcraft.openmm.pair import lj_coul, wca
 from mdcraft.openmm.reporter import NetCDFReporter
 from mdcraft.openmm.system import register_particles, add_image_charges
 from mdcraft.openmm.topology import create_atoms
-from mdcraft.openmm.unit import get_lj_scaling_factors
+from mdcraft.openmm.unit import get_lj_scale_factors
 
 logging.basicConfig(format="{asctime} | {levelname:^8s} | {message}",
                     style="{", level=logging.INFO)
@@ -28,6 +28,7 @@ rho_reduced = 0.8
 temperature = 300 * unit.kelvin
 mass = 72 * unit.gram / unit.mole
 sigma = 0.3 * unit.nanometer
+L_z_scale = 2.5
 e = 1 * unit.elementary_charge
 varepsilon_r = 78.0
 sigma_q_reduced = 0.005
@@ -36,15 +37,17 @@ dt_reduced = 0.005
 every = 1_000
 timesteps = 100 * every
 
-scales = get_lj_scaling_factors({
-    "energy": (unit.BOLTZMANN_CONSTANT_kB
-               * temperature).in_units_of(unit.kilojoule),
-    "length": sigma,
-    "mass": mass
-})
+scales = get_lj_scale_factors(
+    {
+        "energy": (unit.BOLTZMANN_CONSTANT_kB * temperature)
+                  .in_units_of(unit.kilojoule),
+        "length": sigma,
+        "mass": mass
+    }
+)
 
 rho = rho_reduced / scales["length"] ** 3
-box_length_nd = ((N / (2.5 * rho)) ** (1 / 3)).value_in_unit(unit.nanometer)
+box_length_nd = ((N / (L_z_scale * rho)) ** (1 / 3)).value_in_unit(unit.nanometer)
 positions_wall, dimensions = create_atoms(
     np.array((box_length_nd, box_length_nd, 0)),
     lattice="hcp",
@@ -59,8 +62,9 @@ system.setDefaultPeriodicBoxVectors(
 )
 topology = app.Topology()
 topology.setUnitCellDimensions(dimensions)
-logging.info("Created simulation system and topology with dimensions "
-             f"{dimensions[0]} x {dimensions[1]} x {dimensions[2]}.")
+logging.info("Created simulation system and topology with "
+             f"dimensions {dimensions[0]} x {dimensions[1]} "
+             f"x {dimensions[2]}.")
 
 # cutoff = 2 ** (1 / 6) * sigma
 # pair_wca = wca(cutoff)
@@ -171,30 +175,22 @@ positions, integrator = add_image_charges(
 
 simulation = app.Simulation(topology, system, integrator, plat, properties)
 simulation.context.setPositions(positions)
-kinetic_velocity = np.sqrt(
-    3 * scales["molar_energy"] / scales["mass"]
-).in_units_of(unit.nanometer / unit.picosecond)
-velocities = np.random.uniform(-1, 1, (N, 3))
-velocities /= np.linalg.norm(velocities, axis=1)[:, None]
-velocities *= kinetic_velocity
-velocities = (np.vstack((velocities, np.zeros((N + 4 * N_wall, 3))))
-              * unit.nanometer / unit.picosecond)
-simulation.context.setVelocities(velocities)
+simulation.context.setVelocitiesToTemperature(temperature)
 
-fname = f"ic_sigmaq_{sigma_q_reduced}_openmm"
-with open(f"{fname}.cif", "w") as f:
+filename = f"ic_sigmaq_{sigma_q_reduced}_openmm"
+with open(f"{filename}.cif", "w") as f:
     app.PDBxFile.writeFile(simulation.topology, positions, f, keepIds=True)
-logging.info(f"Wrote topology to '{fname}.cif'.")
+logging.info(f"Wrote topology to '{filename}.cif'.")
 
 simulation.reporters.append(
-    app.CheckpointReporter(f"{fname}.chk", 100 * every)
+    app.CheckpointReporter(f"{filename}.chk", 100 * every)
 )
 logging.info("Registered checkpoint reporter writing to "
-             f"'{fname}.cif' to the simulation.")
-simulation.reporters.append(NetCDFReporter(f"{fname}.nc", every))
+             f"'{filename}.cif' to the simulation.")
+simulation.reporters.append(NetCDFReporter(f"{filename}.nc", every))
 logging.info("Registered trajectory reporter writing to "
-             f"'{fname}.nc' to the simulation.")
-for o in [sys.stdout, f"{fname}.log"]:
+             f"'{filename}.nc' to the simulation.")
+for o in [sys.stdout, f"{filename}.log"]:
     simulation.reporters.append(
         app.StateDataReporter(
             o, reportInterval=every, step=True, temperature=True,
@@ -204,10 +200,10 @@ for o in [sys.stdout, f"{fname}.log"]:
         )
     )
 logging.info("Registered state data reporter writing to "
-             f"'{fname}.log' to the simulation.")
+             f"'{filename}.log' to the simulation.")
 
 logging.info(f"Starting NVT run with {timesteps:,} timesteps...")
 simulation.step(timesteps)
-simulation.saveState(f"{fname}.xml")
+simulation.saveState(f"{filename}.xml")
 logging.info("Simulation completed. Wrote final simulation state "
-             f"to '{fname}.xml'.")
+             f"to '{filename}.xml'.")

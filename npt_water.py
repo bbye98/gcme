@@ -3,12 +3,12 @@
 """
 npt_water.py
 ============
-Simulates isothermal–isobaric (NpT) systems of equisized particles
-interacting via the nonelectrostatic Gaussian core model (GCM) pairwise
-potential using the OpenMM. The resulting time-averaged volumes (or
-number densities) from simulations with different pressures and GCM
-repulsion parameters can be used to determine the scaling parameter in
-the water GCM.
+Simulates isothermal–isobaric (NpT) systems of equisized neutral
+particles interacting via the excluded volume interaction potential in
+the Gaussian core model with smeared electrostatics (GCMe) using OpenMM.
+The resulting time-averaged volumes (or number densities) from
+simulations with different pressures and GCMe repulsion parameters can
+be used to determine the scaling parameter in the key GCMe relationship.
 """
 
 import logging
@@ -21,23 +21,27 @@ import openmm
 from openmm import app, unit
 from scipy import optimize
 
-from mdcraft.openmm import pair, system as s, topology as t, unit as u
+from mdcraft.openmm.pair import gauss
+from mdcraft.openmm.system import register_particles
+from mdcraft.openmm.topology import create_atoms
+from mdcraft.openmm.unit import get_lj_scale_factors
 
 ORIG_PATH = os.getcwd()                             # Original directory
-ROOM_TEMP = 300 * unit.kelvin                       # Room temperature (300 K)
-RHO = 0.99657 * unit.gram / unit.centimeter ** 3    # Water mass density (300 K)
+ROOM_TEMP = 300 * unit.kelvin                       # Room temperature
+RHO = 0.99657 * unit.gram / unit.centimeter ** 3    # Water mass density @ 300 K
 MW = 18.01528 * unit.amu                            # Water molar mass
 DIAMETER = 0.275 * unit.nanometer                   # Water molecule size
 
 def run(N: int, p_md: float, A_md: float, frames: int, *,
         temperature: unit.Quantity = ROOM_TEMP, size: unit.Quantity = DIAMETER,
-        mass: unit.Quantity = MW, freq: int = 100, u_shift_md: float = 1e-6,
-        dt_md: float = 0.01, every: int = 10_000, device: int = 0,
-        path: str = None, verbose: bool = True) -> None:
+        mass: unit.Quantity = MW, frequency: int = 100,
+        u_shift_md: float = 1e-6, dt_md: float = 0.01, every: int = 10_000,
+        device: int = 0, path: str = None, verbose: bool = True) -> None:
 
     """
     Run a NpT simulation of coarse-grained particles interacting via the
-    GCM using the OpenMM CUDA platform.
+    excluded volume interaction potential in GCMe using the OpenMM CUDA
+    platform.
 
     Parameters
     ----------
@@ -48,14 +52,14 @@ def run(N: int, p_md: float, A_md: float, frames: int, *,
         Reduced system pressure.
 
     A_md : `float`
-        Reduced GCM repulsion parameter.
+        Reduced GCMe repulsion parameter.
 
     frames : `int`
         Total number of frames. (The total number of timesteps is
         `frames` times `every`.)
 
-        **Example**: :code:`3000` for 3,000 frames, or a total of
-        :code:`3000 * every` timesteps.
+        **Example**: :code:`3_000` for 3,000 frames, or a total of
+        :code:`3_000 * every` timesteps.
 
     temperature : `openmm.unit.Quantity`, keyword-only, \
     default: :code:`300 * unit.kelvin`
@@ -65,27 +69,27 @@ def run(N: int, p_md: float, A_md: float, frames: int, *,
 
     size : `openmm.unit.Quantity`, keyword-only, \
     default: :code:`0.275 * unit.nanometer`
-        Simulation bead diameter.
+        Particle diameter.
 
         **Reference unit**: :math:`\\mathrm{nm}`.
 
     mass : `openmm.unit.Quantity`, keyword-only, \
     default: :code:`18.01528 * unit.amu`
-        Simulation bead mass.
+        Particle mass.
 
         **Reference unit**: :math:`\\mathrm{g/mol}`.
 
-    freq : `int`, keyword-only, default: :code:`100`
+    frequency : `int`, keyword-only, default: :code:`100`
         Monte Carlo pressure change attempt frequency, in timesteps.
 
     u_shift_md : `float`, keyword-only, default: :code:`1e-6`
         Reduced potential energy at which to truncate and shift the
-        nonelectrostatic excluded volume interactions.
+        excluded volume interaction potential.
 
     dt_md : `float`, keyword-only, default: :code:`0.01`
         Reduced timestep.
 
-    every : `int`, keyword-only, default: :code:`10000`
+    every : `int`, keyword-only, default: :code:`10_000`
         Thermodynamic data and trajectory output frequency.
 
     device : `int`, keyword-only, default: :code:`0`
@@ -94,17 +98,19 @@ def run(N: int, p_md: float, A_md: float, frames: int, *,
         **Valid values**: `device` must be greater than or equal to 0.
 
     path : `str`, keyword-only, optional
-        Directory to store data. If it does not exist, it is created. If
-        not specified, the directory containing this script is used.
+        Directory to store data. If it does not exist, it will be
+        created. If not specified, the current directory is used.
 
     verbose : `bool`, keyword-only, default: :code:`True`
         Determines whether detailed progress is shown.
     """
 
     # Set up logger
-    logging.basicConfig(format="{asctime} | {levelname:^8s} | {message}",
-                        style="{",
-                        level=logging.INFO if verbose else logging.WARNING)
+    logging.basicConfig(
+        format="{asctime} | {levelname:^8s} | {message}",
+        style="{",
+        level=logging.INFO if verbose else logging.WARNING
+    )
 
     # Change to the data directory
     if path is None:
@@ -116,12 +122,14 @@ def run(N: int, p_md: float, A_md: float, frames: int, *,
     logging.info(f"Changed to data directory '{path}'.")
 
     # Determine the parameter scales using the fundamental quantities
-    scales = u.get_lj_scaling_factors({
-        "energy": (unit.BOLTZMANN_CONSTANT_kB
-                   * temperature).in_units_of(unit.kilojoule),
-        "length": size,
-        "mass": mass
-    })
+    scales = get_lj_scale_factors(
+        {
+            "energy": (unit.BOLTZMANN_CONSTANT_kB
+                    * temperature).in_units_of(unit.kilojoule),
+            "length": size,
+            "mass": mass
+        }
+    )
     logging.info("Computed scaling factors for reducing physical quantities.\n"
                  "  Fundamental quantities:\n"
                  f"    Molar energy: {scales['molar_energy']}\n"
@@ -130,16 +138,16 @@ def run(N: int, p_md: float, A_md: float, frames: int, *,
 
     # Determine the system dimensions
     rho = unit.AVOGADRO_CONSTANT_NA * RHO / scales["mass"]
-    L_nd = (N / rho) ** (1 / 3) / unit.nanometer
-    dims = np.array((L_nd, L_nd, L_nd)) * unit.nanometer
+    dimensions = (N / rho) ** (1 / 3) * np.ones(3)
 
     # Initialize simulation system and topology
     system = openmm.System()
-    system.setDefaultPeriodicBoxVectors(*(dims * np.diag(np.ones(3))))
+    system.setDefaultPeriodicBoxVectors(*(dimensions * np.diag(np.ones(3))))
     topology = app.Topology()
-    topology.setUnitCellDimensions(dims)
+    topology.setUnitCellDimensions(dimensions)
     logging.info("Created simulation system and topology with "
-                 f"dimensions {dims[0]} x {dims[1]} x {dims[2]}.")
+                 f"dimensions {dimensions[0]} x {dimensions[1]} "
+                 f"x {dimensions[2]}.")
 
     # Set up the nonelectrostatic excluded volume interactions
     A = A_md * scales["molar_energy"] * scales["length"] ** 3
@@ -150,7 +158,7 @@ def run(N: int, p_md: float, A_md: float, frames: int, *,
                   / scales["molar_energy"] - u_shift_md,
         scales["length"].value_in_unit(unit.nanometer)
     )[0] * unit.nanometer
-    pair_gauss = pair.gauss(cutoff, mix="core", global_params={"A": A})
+    pair_gauss = gauss(cutoff, mix="core", global_params={"A": A})
 
     # Register force field to simulation
     system.addForce(pair_gauss)
@@ -158,69 +166,66 @@ def run(N: int, p_md: float, A_md: float, frames: int, *,
                  "potential(s) to the simulation.")
 
     # Register particles to pair potential
-    s.register_particles(
-        system, topology, N, scales["mass"],
-        name="H2O",
-        cnbforces={pair_gauss: (scales["length"] / 2,)}
-    )
+    register_particles(system, topology, N, scales["mass"], name="H2O",
+                       cnbforces={pair_gauss: (scales["length"] / 2,)})
     logging.info(f"Registered {N:,} water particles to the simulation.")
 
     # Determine the filename prefix
-    fname = f"npt_A_{A_md:.3f}_p_{p_md:.2f}"
+    filename = f"npt_A_{A_md:.3f}_p_{p_md:.2f}"
 
     # Ensure a simulation with the same filename does not already exist
-    if os.path.isfile(f"{fname}.log"):
-        emsg = (f"A simulation with the filename prefix '{fname}' "
+    if os.path.isfile(f"{filename}.log"):
+        emsg = (f"A simulation with the filename prefix '{filename}' "
                 "already exists.")
         raise RuntimeError(emsg)
 
     # Create OpenMM CUDA Platform
-    plat = openmm.Platform.getPlatformByName("CUDA")
+    platform_ = openmm.Platform.getPlatformByName("CUDA")
     properties = {"Precision": "mixed", "DeviceIndex": str(device),
                   "UseBlockingSync": "false"}
     dt = dt_md * scales["time"]
-    fric = 1e-3 / dt
-    logging.info(f"Initialized the {plat.getName()} platform in OpenMM "
-                 f"{plat.getOpenMMVersion()} on {platform.node()}.")
+    friction = 1e-3 / dt
+    logging.info(f"Initialized the {platform_.getName()} platform in OpenMM "
+                 f"{platform_.getOpenMMVersion()} on {platform.node()}.")
 
     # Generate initial particle positions
-    pos = t.create_atoms(dims, N)
+    positions = create_atoms(dimensions, N)
     logging.info("Generated random initial configuration for "
-                 f"{len(pos):,} particles.")
+                 f"{len(positions):,} particles.")
 
     # Perform NVT energy minimization
     logging.info("Starting system relaxation...")
-    integrator = openmm.LangevinMiddleIntegrator(temperature, fric, dt)
-    simulation = app.Simulation(topology, system, integrator, plat,
+    integrator = openmm.LangevinMiddleIntegrator(temperature, friction, dt)
+    simulation = app.Simulation(topology, system, integrator, platform_,
                                 properties)
-    simulation.context.setPositions(pos)
+    simulation.context.setPositions(positions)
     simulation.minimizeEnergy()
-    pos = simulation.context.getState(getPositions=True).getPositions(
-        asNumpy=True
-    )
+    positions = (simulation.context.getState(getPositions=True)
+                 .getPositions(asNumpy=True))
+    simulation.context.setVelocitiesToTemperature(temperature)
     logging.info("Local energy minimization completed.")
 
     # Add Monte Carlo barostat and reinitialize simulation context
-    pres = p_md * scales["pressure"]
-    system.addForce(openmm.MonteCarloBarostat(pres, temperature, freq))
-    logging.info(f"Registered Monte Carlo barostat at {pres} and "
+    pressure = p_md * scales["pressure"]
+    system.addForce(openmm.MonteCarloBarostat(pressure, temperature, frequency))
+    logging.info(f"Registered Monte Carlo barostat at {pressure} and "
                  f"{temperature} to the simulation.")
     simulation.context.reinitialize()
-    simulation.context.setPositions(pos)
+    simulation.context.setPositions(positions)
 
     # Write topology file
-    with open(f"{fname}.cif", "w") as f:
-        app.PDBxFile.writeFile(simulation.topology, pos, f, keepIds=True)
-    logging.info(f"Wrote topology to '{fname}.cif'.")
+    with open(f"{filename}.cif", "w") as f:
+        app.PDBxFile.writeFile(simulation.topology, positions, f, keepIds=True)
+    logging.info(f"Wrote topology to '{filename}.cif'.")
 
     # Register checkpoint and thermodynamic state data reporters
     simulation.reporters.append(
-        app.CheckpointReporter(f"{fname}.chk", 100 * every)
+        app.CheckpointReporter(f"{filename}.chk", 100 * every)
     )
     logging.info("Registered checkpoint reporter writing to "
-                 f"'{fname}.cif' to the simulation.")
+                 f"'{filename}.cif' to the simulation.")
     timesteps = frames * every
-    for o in [sys.stdout, f"{fname}.log"]:
+    for o in [sys.stdout, f"{filename}.log"]:
         simulation.reporters.append(
             app.StateDataReporter(
                 o, reportInterval=every, step=True, temperature=True,
@@ -230,14 +235,14 @@ def run(N: int, p_md: float, A_md: float, frames: int, *,
             )
         )
     logging.info("Registered state data reporter writing to "
-                 f"'{fname}.log' to the simulation.")
+                 f"'{filename}.log' to the simulation.")
 
     # Run NpT simulation
     logging.info(f"Starting NpT run with {timesteps:,} timesteps...")
     simulation.step(timesteps)
-    simulation.saveState(f"{fname}.xml")
+    simulation.saveState(f"{filename}.xml")
     logging.info("Simulation completed. Wrote final simulation state "
-                 f"to '{fname}.xml'.")
+                 f"to '{filename}.xml'.")
 
 if __name__ == "__main__":
 
@@ -245,12 +250,10 @@ if __name__ == "__main__":
     N: int = 10_000
     frames: int = 5_000
 
-    As_md: np.ndarray = np.array((5, 6, 10, 20), dtype=float)
-    ps_md: np.ndarray = np.array(
-        (4_500, 4_000, 3_000, 2_000, 1_000, 750, 500, 400, 300, 200, 100, 75,
-         50, 40, 30, 20, 10, 7.5, 5, 4, 3, 2, 1, 0.5),
-        dtype=float
-    )
+    As_md: list[float] = [5.0, 6.0, 10.0, 20.0]
+    ps_md: list[float] = [4_500.0, 4_000.0, 3_000.0, 2_000.0, 1_000.0, 750.0,
+                          500.0, 400.0, 300.0, 200.0, 100.0, 75.0, 50.0, 40.0,
+                          30.0, 20.0, 10.0, 7.5, 5.0, 4.0, 3.0, 2.0, 1.0, 0.5]
 
     for p_md in ps_md:
         for A_md in As_md:
